@@ -463,7 +463,7 @@ class MiniMaxH3HybridLoader:
                     "'custom' = use custom_overlays only."}),
             },
             "optional": {
-                "block_range_start":  ("INT", {"default": 30, "min": 0, "max": 49, "step": 1, "tooltip":
+                "block_range_start":  ("INT", {"default": 25, "min": 0, "max": 49, "step": 1, "tooltip":
                     "Only used when overlay_preset == 'block_range_adaln'. "
                     "Lower-inclusive bound on the block index whose adaln_proj "
                     "comes from overlay_model. The minimax h3 DiT has 50 blocks "
