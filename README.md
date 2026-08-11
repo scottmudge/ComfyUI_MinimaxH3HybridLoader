@@ -13,6 +13,20 @@ A tensor-by-tensor comparison (see [`minimax_h3_analysis.md`](./minimax_h3_analy
 
 So a promising hybrid is: load `fl2va` as the base (high-quality attention, MLPs, and output heads), and overlay *only* the per-block `adaln_proj` weights from `ref2va` (preserving the reference-conditioning pathway). This node exposes that configuration as its default preset, plus several coarser / finer presets and an explicit custom glob string so you can experiment.
 
+## Recommended Settings for Higher Ref2VA Quality:
+
+<img width="653" height="337" alt="good_settings" src="https://github.com/user-attachments/assets/cef3dbc1-0424-435f-99c9-4a5ed8d337ca" />
+
+After testing this is what I, subjectively, think is the best in terms of reference capability and visual/audio quality:
+
+* **fl2va** model as **base**
+* **ref2va** model as **overlay**
+* **block_range_adaln** overlay preset
+* **block_range_start** set to **30**
+* **block_range_end** set to **49**
+  
+All other settings default
+
 ## Features
 
 - **Memory-friendly:** both safetensors files are opened mmap-backed and tensors are streamed one key at a time. Peak RSS is one model's worth (~19.5 GB for the int8 checkpoints), not 2× — the same as the stock loader.
