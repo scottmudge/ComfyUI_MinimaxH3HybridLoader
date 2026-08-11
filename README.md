@@ -39,10 +39,10 @@ All other settings default
 | Preset | What it does |
 |---|---|
 | `none` | Pure base loading (equivalent to stock `UNETLoader`). |
-| `ref2va_adaln_over_fl2va` *(default)* | Take per-block `adaln_proj.linear.*` from the overlay only. The recommended hybrid. |
+| `ref2va_adaln_over_fl2va` | Take per-block `adaln_proj.linear.*` from the overlay only. The recommended hybrid. |
 | `ref2va_all_adaln_over_fl2va` | Also take `final_layer.adaln_proj` from the overlay. "Max-reference, accept-quality-loss" knob. |
 | `ref2va_full_over_fl2va` / `fl2va_full_over_ref2va` | Take everything from the overlay (sanity checks). |
-| `block_range_adaln` | Take `adaln_proj` only for blocks in `[block_range_start, block_range_end]` (inclusive, 0..49). |
+| `block_range_adaln` *(default)* | Take `adaln_proj` only for blocks in `[block_range_start, block_range_end]` (inclusive, 0..49). |
 | `custom` | Use `custom_overlays` / `custom_base` only. |
 
 ## Optional inputs
