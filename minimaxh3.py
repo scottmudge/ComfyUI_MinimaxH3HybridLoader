@@ -550,15 +550,3 @@ class MiniMaxH3HybridLoader:
         )
         return (patcher,)
 
-
-# ---------------------------------------------------------------------------
-# Mapping used by __init__.py
-# ---------------------------------------------------------------------------
-
-NODE_CLASS_MAPPINGS = {
-    "MiniMaxH3HybridLoader": MiniMaxH3HybridLoader,
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "MiniMaxH3HybridLoader": "😸 MiniMax H3 Hybrid Loader",
-}
