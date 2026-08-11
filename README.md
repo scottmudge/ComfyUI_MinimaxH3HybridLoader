@@ -22,7 +22,7 @@ After testing this is what I, subjectively, think is the best in terms of refere
 * **fl2va** model as **base**
 * **ref2va** model as **overlay**
 * **block_range_adaln** overlay preset
-* **block_range_start** set to **30**
+* **block_range_start** set to **25** (30 in screenshot, but 25 may be a better compromise between quality and reference retention)
 * **block_range_end** set to **49**
   
 All other settings default
