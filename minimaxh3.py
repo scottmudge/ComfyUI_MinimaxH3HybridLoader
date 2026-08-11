@@ -453,7 +453,7 @@ class MiniMaxH3HybridLoader:
             "required": {
                 "base_model":      (files, {"tooltip": "Primary checkpoint -- every tensor starts here."}),
                 "overlay_model":   (files, {"tooltip": "Secondary checkpoint -- tensors matched by overlay_preset come from here. May equal base_model (effectively loads base only)."}),
-                "overlay_preset":  (PRESET_LIST, {"default": "ref2va_adaln_over_fl2va", "tooltip":
+                "overlay_preset":  (PRESET_LIST, {"default": "block_range_adaln", "tooltip":
                     "Which tensor groups to take from overlay_model. "
                     "'none' = pure base loading (equivalent to stock UNETLoader). "
                     "'ref2va_adaln_over_fl2va' (default) = take per-block adaln_proj from the overlay only. "
@@ -463,7 +463,7 @@ class MiniMaxH3HybridLoader:
                     "'custom' = use custom_overlays only."}),
             },
             "optional": {
-                "block_range_start":  ("INT", {"default": 0, "min": 0, "max": 49, "step": 1, "tooltip":
+                "block_range_start":  ("INT", {"default": 30, "min": 0, "max": 49, "step": 1, "tooltip":
                     "Only used when overlay_preset == 'block_range_adaln'. "
                     "Lower-inclusive bound on the block index whose adaln_proj "
                     "comes from overlay_model. The minimax h3 DiT has 50 blocks "
