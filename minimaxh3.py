@@ -37,11 +37,12 @@ custom prefix string, so the user can experiment.
 
 Memory
 ------
-Both safetensors files are opened with ``safetensors.safe_open`` (mmap
-backed). Tensors are read *one key at a time* and placed into the merged
-state dict, so peak RSS is the size of the merged dict (~one model's worth
-of tensor data) plus a few transient tensors -- the same ~19.5 GB the
-stock loader uses -- not 2x19.5 GB.
+With DynamicVRAM/AIMDO enabled, each source checkpoint uses one of ComfyUI's
+managed ``ModelMMAP`` objects. Only the selected tensors are exposed to the
+merged state dict, and ComfyUI can bounce file-backed pages between execution
+stages just as it does for the stock diffusion-model loader. Without AIMDO the
+loader falls back to read-only per-tensor mappings. Neither path copies the
+selected full-width AdaLN tensors into ordinary RAM.
 
 This node does not mutate either safetensors file on disk; both files are
 opened read-only.
@@ -49,18 +50,25 @@ opened read-only.
 
 from __future__ import annotations
 
+import ctypes
 import fnmatch
 import json
 import logging
+import mmap
 import os
 import re
+import struct
+import threading
+import warnings
+from math import prod
 from typing import Callable
 
 import torch
-from safetensors import safe_open
 
 import comfy.sd
+import comfy.memory_management
 import comfy.utils
+import comfy_aimdo.model_mmap
 import folder_paths
 
 
@@ -164,15 +172,202 @@ PRESET_LIST = list(PRESETS.keys())
 # Core merging: build a state dict from two safetensors files
 # ---------------------------------------------------------------------------
 
-def _open_safetensors(path: str):
-    """Open a safetensors file read-only. Verify keys are present.
-
-    Returns (handle, keys_set)."""
+def _read_checkpoint_header(path: str):
+    """Read the keys, metadata, layout, and tensor specs without retaining an mmap."""
     if not os.path.isfile(path):
         raise FileNotFoundError(f"MiniMax H3 hybrid loader: file not found: {path}")
-    f = safe_open(path, framework="pt", device="cpu")
-    keys = set(f.keys())
-    return f, keys
+    with open(path, "rb") as header_f:
+        header_size = struct.unpack("<Q", header_f.read(8))[0]
+        header = json.loads(header_f.read(header_size))
+    metadata = header.get("__metadata__") or {}
+    tensor_header = {key: info for key, info in header.items() if key != "__metadata__"}
+    keys = set(tensor_header)
+    specs = {
+        key: (info["shape"], info["dtype"])
+        for key, info in tensor_header.items()
+    }
+    data_offset = 8 + header_size
+    offsets = {
+        key: (data_offset + info["data_offsets"][0],
+              info["data_offsets"][1] - info["data_offsets"][0])
+        for key, info in tensor_header.items()
+    }
+    topology, storage_format = _checkpoint_layout(keys, path, specs, offsets)
+    return keys, metadata, topology, storage_format, specs, offsets
+
+
+def _checkpoint_layout(keys: set[str], path: str, specs: dict, offsets: dict) -> tuple[str, str]:
+    """Identify the ComfyUI MiniMax H3 topology and storage format."""
+    required = {
+        "video_patch_proj.weight",
+        "audio_patch_proj.weight",
+        "blocks.0.attn.qkv_proj.weight",
+        "blocks.0.adaln_proj.linear.weight",
+        "final_layer.adaln_proj.linear.weight",
+    }
+    missing = required - keys
+    if missing:
+        raise RuntimeError(
+            "MiniMax H3 hybrid loader: checkpoint is not a supported ComfyUI "
+            f"MiniMax H3 diffusion model. missing={sorted(missing)} file={path!r}"
+        )
+
+    has_curve_table = "adaln_t_table" in keys
+    has_time_embedder = "time_embedder.proj_in.weight" in keys
+    if has_curve_table == has_time_embedder:
+        raise RuntimeError(
+            "MiniMax H3 hybrid loader: cannot identify checkpoint topology; "
+            "expected exactly one of adaln_t_table or time_embedder.proj_in.weight. "
+            f"file={path!r}"
+        )
+    topology = "pruned" if has_curve_table else "full"
+
+    quant_key = "blocks.0.attn.qkv_proj.comfy_quant"
+    if quant_key in keys:
+        try:
+            offset, length = offsets[quant_key]
+            with open(path, "rb") as quant_f:
+                quant_f.seek(offset)
+                quant_config = json.loads(quant_f.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as e:
+            raise RuntimeError(
+                f"MiniMax H3 hybrid loader: invalid quantization metadata in {path!r}"
+            ) from e
+        quant_format = quant_config.get("format", "unknown")
+        if quant_format == "int8_tensorwise" and quant_config.get("convrot", False):
+            quant_format = "int8_convrot"
+    else:
+        quant_format = specs["blocks.0.attn.qkv_proj.weight"][1].lower()
+
+    return topology, quant_format
+
+
+_DTYPE_BYTES = {
+    "BOOL": 1,
+    "U8": 1,
+    "I8": 1,
+    "F8_E4M3": 1,
+    "F8_E5M2": 1,
+    "I16": 2,
+    "U16": 2,
+    "F16": 2,
+    "BF16": 2,
+    "I32": 4,
+    "U32": 4,
+    "F32": 4,
+    "I64": 8,
+    "U64": 8,
+    "F64": 8,
+}
+
+_TORCH_DTYPES = {
+    "BOOL": torch.bool,
+    "U8": torch.uint8,
+    "I8": torch.int8,
+    "F8_E4M3": torch.float8_e4m3fn,
+    "F8_E5M2": torch.float8_e5m2,
+    "I16": torch.int16,
+    "U16": torch.uint16,
+    "F16": torch.float16,
+    "BF16": torch.bfloat16,
+    "I32": torch.int32,
+    "U32": torch.uint32,
+    "F32": torch.float32,
+    "I64": torch.int64,
+    "U64": torch.uint64,
+    "F64": torch.float64,
+}
+
+
+def _spec_nbytes(spec: tuple[list[int], str]) -> int:
+    shape, dtype = spec
+    try:
+        itemsize = _DTYPE_BYTES[dtype]
+    except KeyError as e:
+        raise RuntimeError(
+            f"MiniMax H3 hybrid loader: unsupported safetensors dtype {dtype!r}"
+        ) from e
+    return prod(shape) * itemsize
+
+
+def _map_tensor_slices_aimdo(path: str, keys: set[str], specs: dict, offsets: dict) -> dict:
+    """Expose selected tensors through ComfyUI's managed ModelMMAP."""
+    if not keys:
+        return {}
+
+    file_lock = threading.Lock()
+    model_mmap = comfy_aimdo.model_mmap.ModelMMAP(path)
+    file_handle = model_mmap.get_file_handle()
+    file_size = os.path.getsize(path)
+    file_view = memoryview((ctypes.c_uint8 * file_size).from_address(model_mmap.get()))
+    out = {}
+    for key in sorted(keys):
+        shape, dtype = specs[key]
+        absolute_offset, length = offsets[key]
+        if length == 0:
+            out[key] = torch.empty(shape, dtype=_TORCH_DTYPES[dtype])
+            continue
+        view = file_view[absolute_offset:absolute_offset + length]
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="The given buffer is not writable")
+            tensor = torch.frombuffer(view, dtype=_TORCH_DTYPES[dtype]).view(shape)
+        storage = tensor.untyped_storage()
+        setattr(storage, "_comfy_tensor_file_slice",
+                comfy.memory_management.TensorFileSlice(
+                    file_handle, file_lock, absolute_offset, length
+                ))
+        setattr(storage, "_comfy_tensor_mmap_refs", (model_mmap, file_view))
+        out[key] = tensor
+    return out
+
+
+def _map_tensor_slices_fallback(path: str, keys: set[str], specs: dict, offsets: dict) -> dict:
+    """Map selected byte ranges when AIMDO is unavailable."""
+    if not keys:
+        return {}
+
+    out = {}
+    file_handle = open(path, "rb")
+    file_lock = threading.Lock()
+    try:
+        for key in sorted(keys):
+            shape, dtype = specs[key]
+            absolute_offset, length = offsets[key]
+            if length == 0:
+                out[key] = torch.empty(shape, dtype=_TORCH_DTYPES[dtype])
+                continue
+            aligned_offset = absolute_offset - (absolute_offset % mmap.ALLOCATIONGRANULARITY)
+            view_offset = absolute_offset - aligned_offset
+            mapped = mmap.mmap(
+                file_handle.fileno(),
+                view_offset + length,
+                access=mmap.ACCESS_READ,
+                offset=aligned_offset,
+            )
+            view = memoryview(mapped)[view_offset:view_offset + length]
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="The given buffer is not writable")
+                tensor = torch.frombuffer(view, dtype=_TORCH_DTYPES[dtype]).view(shape)
+            storage = tensor.untyped_storage()
+            setattr(storage, "_minimax_hybrid_mmap_refs",
+                    (file_handle, mapped, view))
+            setattr(storage, "_comfy_tensor_file_slice",
+                    comfy.memory_management.TensorFileSlice(
+                        file_handle, file_lock, absolute_offset, length
+                    ))
+            out[key] = tensor
+    except Exception:
+        file_handle.close()
+        raise
+    if not out:
+        file_handle.close()
+    return out
+
+
+def _map_tensor_slices(path: str, keys: set[str], specs: dict, offsets: dict) -> dict:
+    if comfy.memory_management.aimdo_enabled:
+        return _map_tensor_slices_aimdo(path, keys, specs, offsets)
+    return _map_tensor_slices_fallback(path, keys, specs, offsets)
 
 
 def _expand_custom_overlay_globs(glob_csv: str | None) -> list[str]:
@@ -227,16 +422,15 @@ def build_hybrid_sd(
     Returns
     -------
     (sd, metadata)
-        The merged state dict and (currently empty) metadata, suitable for
+        The merged state dict and base-checkpoint metadata, suitable for
         passing to ``comfy.sd.load_diffusion_model_state_dict``.
 
     Notes
     -----
-    * Both files are opened with ``safe_open`` (mmap, no RAM cost for the
-      19.5 GB weight data). Tensors are read one key at a time into the
-      returned dict, so peak RSS is one model's worth (~19.5 GB for the
-      minimax h3 int8 checkpoints) plus a couple of transient tensors --
-      the same as the stock ``load_torch_file`` loader.
+    * With AIMDO enabled, each source uses one managed whole-file virtual
+      mapping, while only selected tensors are exposed to the model. File pages
+      remain demand-paged and participate in ComfyUI's normal bounce lifecycle.
+      Header inspection uses ordinary file reads before either mapping exists.
     * The ``.comfy_quant`` byte tensors (which encode the shared int8 quant
       format) are present in both checkpoints and bit-identical between
       them, so taking them from either file is equivalent; they always
@@ -250,10 +444,23 @@ def build_hybrid_sd(
       always reads ``.comfy_quant`` from the *same* file as the weight it
       belongs to when the weight is part of an overlay group -- see below).
     """
+    active_matchers = [m for (m, take) in overlay_groups if take]
     if not overlay_path:
         overlay_path = base_path
-    base_f, base_keys = _open_safetensors(base_path)
-    overlay_f, overlay_keys = _open_safetensors(overlay_path)
+    if not active_matchers:
+        overlay_path = base_path
+    base_keys, base_metadata, base_topology, base_format, base_specs, base_offsets = _read_checkpoint_header(base_path)
+    overlay_keys, overlay_metadata, overlay_topology, overlay_format, overlay_specs, overlay_offsets = _read_checkpoint_header(overlay_path)
+    if base_topology != overlay_topology:
+        raise RuntimeError(
+            "MiniMax H3 hybrid loader: pruned and full checkpoints cannot be mixed. "
+            f"base={base_topology} overlay={overlay_topology}"
+        )
+    if base_format != overlay_format:
+        raise RuntimeError(
+            "MiniMax H3 hybrid loader: checkpoints use different storage formats. "
+            f"base={base_format} overlay={overlay_format}"
+        )
 
     # Validate identical key sets -- required for a clean merge. The
     # header JSON of both files is identical (per our analysis), so any key
@@ -270,10 +477,34 @@ def build_hybrid_sd(
                f"{'...' if len(only_overlay)>5 else ''}")
         raise RuntimeError(msg)
 
+    incompatible = []
+    for key in sorted(base_keys):
+        if base_specs[key] != overlay_specs[key]:
+            incompatible.append(key)
+            if len(incompatible) == 5:
+                break
+    if incompatible:
+        raise RuntimeError(
+            "MiniMax H3 hybrid loader: checkpoints contain incompatible tensor "
+            f"shapes or dtypes. first mismatches={incompatible}"
+        )
+
+    base_config = base_metadata.get("config")
+    overlay_config = overlay_metadata.get("config")
+    if base_config and overlay_config and base_config != overlay_config:
+        raise RuntimeError(
+            "MiniMax H3 hybrid loader: checkpoints contain different model configs"
+        )
+
+    logging.info(
+        "[MiniMaxH3Hybrid] detected topology=%s format=%s",
+        base_topology,
+        base_format,
+    )
+
     # Compose the active overlay matcher: union of every group flagged True.
     # We *do not* allow a matcher's "take from base" (False) entry to retract
     # an earlier True; we only collect the True matchers and union them.
-    active_matchers = [m for (m, take) in overlay_groups if take]
     def is_overlay_key(key: str) -> bool:
         return any(m(key) for m in active_matchers)
 
@@ -287,10 +518,7 @@ def build_hybrid_sd(
     # eliminates a class of subtle bugs if a future checkpoint variant ships
     # different quant scales for an overlaid weight.
 
-    sd: dict[str, torch.Tensor] = {}
-    # Read keys in sorted order so the output dict is deterministic; this
-    # also matches the iteration order ``load_torch_file`` would have used.
-    for key in sorted(base_keys):
+    def should_take_overlay(key: str) -> bool:
         take_overlay = is_overlay_key(key)
         if not take_overlay:
             # If this key is a quant sibling of some matched weight, infer its
@@ -303,11 +531,34 @@ def build_hybrid_sd(
                 parent = key[:-len("_scale")]
                 if is_overlay_key(parent + ".weight") or is_overlay_key(parent):
                     take_overlay = True
-        src = overlay_f if take_overlay else base_f
-        sd[key] = src.get_tensor(key)
+        return take_overlay
 
-    metadata: dict = {}
-    return sd, metadata
+    same_file = os.path.samefile(base_path, overlay_path)
+    overlay_selected = (set() if same_file else
+                        {key for key in base_keys if should_take_overlay(key)})
+    base_selected = base_keys - overlay_selected
+    overlay_bytes = sum(_spec_nbytes(overlay_specs[key]) for key in overlay_selected)
+    base_bytes = sum(_spec_nbytes(base_specs[key]) for key in base_selected)
+
+    # AIMDO uses one managed mapping per selected source and can bounce touched
+    # pages at ComfyUI's normal execution boundaries. The fallback retains the
+    # old per-tensor read-only mappings for systems without DynamicVRAM support.
+    sd = _map_tensor_slices(base_path, base_selected, base_specs, base_offsets)
+    sd.update(_map_tensor_slices(
+        overlay_path, overlay_selected, overlay_specs, overlay_offsets
+    ))
+    sd = {key: sd[key] for key in sorted(sd)}
+
+    logging.info(
+        "[MiniMaxH3Hybrid] %s base=%.2f GiB/%d tensors overlay=%.2f GiB/%d tensors",
+        "AIMDO-mapped" if comfy.memory_management.aimdo_enabled else "range-mapped",
+        base_bytes / (1024 ** 3),
+        len(base_selected),
+        overlay_bytes / (1024 ** 3),
+        len(overlay_selected),
+    )
+
+    return sd, base_metadata
 
 
 # ---------------------------------------------------------------------------
